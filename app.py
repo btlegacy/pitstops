@@ -38,10 +38,10 @@ def detect_motion_and_analyze(video_path):
     prev_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
     prev_gray = cv2.GaussianBlur(prev_gray, (21, 21), 0)
     
-    # Define pit box region (center 60% of frame to avoid crowd)
+    # Define pit box region (center 85% of frame to capture full pit area)
     height, width = first_frame.shape[:2]
-    pit_x1, pit_y1 = int(width * 0.2), int(height * 0.2)
-    pit_x2, pit_y2 = int(width * 0.8), int(height * 0.8)
+    pit_x1, pit_y1 = int(width * 0.075), int(height * 0.075)
+    pit_x2, pit_y2 = int(width * 0.925), int(height * 0.925)
     
     # Statistics tracking
     motion_timeline = []
