@@ -98,16 +98,11 @@ def detect_motion_and_analyze(video_path):
         
         crew_activity.append(crew_motion)
         
-        # Detect car in center (less motion when stopped)
-        center_region = pit_region[
-            pit_region.shape[0]//4:3*pit_region.shape[0]//4,
-            pit_region.shape[1]//4:3*pit_region.shape[1]//4
-        ]
-        center_motion = cv2.countNonZero(center_region)
-        center_motion_pct = (center_motion / center_region.size) * 100
+        # In a pit stop, HIGH motion indicates car is stopped with crew working
+        # LOW motion indicates car is moving (entering or exiting)
         
-        # Car is present and stationary when center has low motion
-        is_stationary = center_motion_pct < 5.0  # Low motion in center
+        # Car is stationary when there's HIGH activity (crew working)
+        is_stationary = motion_percentage > 8.0  # High motion = stopped with crew
         has_car = frame_idx > fps * 2  # Skip first 2 seconds (car entering)
         
         motion_timeline.append(motion_percentage)
