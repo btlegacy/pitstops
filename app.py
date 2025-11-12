@@ -16,8 +16,46 @@ st.set_page_config(page_title="Pit Stop Analyzer", layout="wide")
 st.title("🏎️ Pit Stop Analysis System")
 st.markdown("Upload an overhead video of a pit stop to generate detailed statistics")
 
-def detect_motion_and_analyze(video_path):
-    """Analyze pit stop using motion detection and color-based tracking"""
+def find_car_hsv(frame):
+    """Find the race car using color detection and return its center position"""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    # Define color ranges for the car (adjust these based on car colors)
+    # Green/lime colors (for the car in the video)
+    lower_green = np.array([35, 40, 40])
+    upper_green = np.array([85, 255, 255])
+    
+    # Create mask
+    mask = cv2.inRange(hsv, lower_green, upper_green)
+    
+    # Clean up the mask
+    kernel = np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return None, mask
+    
+    # Find the largest contour (likely the car)
+    largest_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest_contour)
+    
+    # Filter out small detections
+    if area < 500:
+        return None, mask
+    
+    # Get bounding box
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    center_x = x + w/2
+    center_y = y + h/2
+    
+    return (center_x, center_y, area), mask
+
+def analyze_pit_stop(video_path):
+    """Analyze pit stop by tracking car's horizontal position"""
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
@@ -28,131 +66,113 @@ def detect_motion_and_analyze(video_path):
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = frame_count / fps if fps > 0 else 0
     
-    # Read first frame as reference
-    ret, first_frame = cap.read()
-    if not ret:
-        st.error("Could not read first frame")
-        return None
-    
-    # Convert to grayscale and blur for motion detection
-    prev_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-    prev_gray = cv2.GaussianBlur(prev_gray, (21, 21), 0)
-    
-    # Define pit box region (center 85% of frame to capture full pit area)
-    height, width = first_frame.shape[:2]
-    pit_x1, pit_y1 = int(width * 0.075), int(height * 0.075)
-    pit_x2, pit_y2 = int(width * 0.925), int(height * 0.925)
-    
     # Statistics tracking
-    motion_timeline = []
-    car_present = []
-    crew_activity = []
+    car_positions = []
+    horizontal_velocities = []
+    stationary_frames = 0
     stop_detected = False
     stop_start_frame = None
     stop_end_frame = None
-    max_activity_frame = 0
-    max_activity_value = 0
+    crew_activity = []
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Display sample frame
+    # Display sample frames
     sample_col1, sample_col2 = st.columns(2)
     
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     frame_idx = 0
-    stationary_count = 0
-    moving_count = 0
+    prev_position = None
+    prev_gray = None
+    
+    # Define pit box region for crew detection
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    pit_x1, pit_y1 = int(width * 0.075), int(height * 0.075)
+    pit_x2, pit_y2 = int(width * 0.925), int(height * 0.925)
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Convert to grayscale
+        # Find the car
+        car_data, mask = find_car_hsv(frame)
+        
+        if car_data:
+            center_x, center_y, area = car_data
+            car_positions.append((frame_idx, center_x, center_y, area))
+            
+            # Calculate horizontal velocity
+            if prev_position is not None:
+                h_velocity = abs(center_x - prev_position[0])
+                horizontal_velocities.append(h_velocity)
+                
+                # Car is stationary if horizontal movement is less than 2 pixels
+                is_stationary = h_velocity < 2.0
+                
+                if is_stationary and frame_idx > fps * 2:  # Skip first 2 seconds
+                    stationary_frames += 1
+                    
+                    # Detect stop start
+                    if not stop_detected and stationary_frames > fps * 1.0:
+                        stop_start_frame = frame_idx - int(fps * 1.0)
+                        stop_detected = True
+                else:
+                    # Car is moving
+                    if stop_detected and stop_end_frame is None and stationary_frames > fps * 2.0:
+                        # Car was stopped for at least 2 seconds and is now moving
+                        stop_end_frame = frame_idx
+                    
+                    if not stop_detected:
+                        stationary_frames = 0
+            
+            prev_position = (center_x, center_y)
+        else:
+            horizontal_velocities.append(0)
+        
+        # Detect crew activity using motion detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (21, 21), 0)
         
-        # Compute frame difference for motion detection
-        frame_delta = cv2.absdiff(prev_gray, gray)
-        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        
-        # Focus on pit box region
-        pit_region = thresh[pit_y1:pit_y2, pit_x1:pit_x2]
-        
-        # Calculate motion metrics
-        motion_pixels = cv2.countNonZero(pit_region)
-        motion_percentage = (motion_pixels / (pit_region.size)) * 100
-        
-        # Detect crew activity (motion around edges of pit box)
-        edge_region_top = thresh[pit_y1:pit_y1+50, pit_x1:pit_x2]
-        edge_region_bottom = thresh[pit_y2-50:pit_y2, pit_x1:pit_x2]
-        edge_region_left = thresh[pit_y1:pit_y2, pit_x1:pit_x1+50]
-        edge_region_right = thresh[pit_y1:pit_y2, pit_x2-50:pit_x2]
-        
-        crew_motion = (cv2.countNonZero(edge_region_top) + 
-                      cv2.countNonZero(edge_region_bottom) +
-                      cv2.countNonZero(edge_region_left) + 
-                      cv2.countNonZero(edge_region_right))
-        
-        crew_activity.append(crew_motion)
-        
-        motion_timeline.append(motion_percentage)
-        
-        # Pit stop detection strategy:
-        # 1. Look for motion crossing ABOVE 12% threshold (car stops, crew rushes)
-        # 2. Then wait for motion to drop BELOW 8% and stay there (car is stationary)
-        # 3. Exit when motion spikes ABOVE 8% again after being low (car departs)
-        
-        if not stop_detected:
-            # Looking for entry - need to see high motion spike first
-            if motion_percentage > 12.0 and frame_idx > fps * 2:
-                stationary_count += 1
-                if stationary_count > fps * 0.5:
-                    stop_start_frame = frame_idx - int(fps * 0.5) 
-                    stop_detected = True
-                    stationary_count = 0
-            else:
-                stationary_count = 0
-        
-        elif stop_detected and stop_end_frame is None:
-            # Car is stopped - wait for motion to spike again (departure)
-            # But ignore spikes in the first 20 seconds (initial crew activity)
-            time_since_stop = (frame_idx - stop_start_frame) / fps
+        if prev_gray is not None:
+            frame_delta = cv2.absdiff(prev_gray, gray)
+            thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+            thresh = cv2.dilate(thresh, None, iterations=2)
             
-            if time_since_stop > 20 and motion_percentage > 10.0:
-                # Possible departure
-                moving_count += 1
-                if moving_count > fps * 1.0:
-                    stop_end_frame = frame_idx - int(fps * 1.0)
-            else:
-                moving_count = 0
-        
-        # Track car presence
-        if stop_detected and stop_end_frame is None:
-            car_present.append(True)
+            pit_region = thresh[pit_y1:pit_y2, pit_x1:pit_x2]
+            edge_region_top = thresh[pit_y1:pit_y1+50, pit_x1:pit_x2]
+            edge_region_bottom = thresh[pit_y2-50:pit_y2, pit_x1:pit_x2]
+            edge_region_left = thresh[pit_y1:pit_y2, pit_x1:pit_x1+50]
+            edge_region_right = thresh[pit_y1:pit_y2, pit_x2-50:pit_x2]
+            
+            crew_motion = (cv2.countNonZero(edge_region_top) + 
+                          cv2.countNonZero(edge_region_bottom) +
+                          cv2.countNonZero(edge_region_left) + 
+                          cv2.countNonZero(edge_region_right))
+            
+            crew_activity.append(crew_motion)
         else:
-            car_present.append(False)
+            crew_activity.append(0)
         
-        # Track maximum activity
-        if crew_motion > max_activity_value:
-            max_activity_value = crew_motion
-            max_activity_frame = frame_idx
+        prev_gray = gray
         
         # Show sample frames
         if frame_idx == int(frame_count * 0.3):
             with sample_col1:
-                st.image(frame, caption=f"Frame at 30% ({frame_idx})", use_container_width=True)
+                vis_frame = frame.copy()
+                if car_data:
+                    cv2.circle(vis_frame, (int(center_x), int(center_y)), 10, (0, 255, 0), -1)
+                st.image(vis_frame, caption=f"Frame at 30% ({frame_idx}) - Car Detection", use_container_width=True)
                 
         if frame_idx == int(frame_count * 0.6):
             with sample_col2:
-                # Draw detection region
                 vis_frame = frame.copy()
+                if car_data:
+                    cv2.circle(vis_frame, (int(center_x), int(center_y)), 10, (0, 255, 0), -1)
                 cv2.rectangle(vis_frame, (pit_x1, pit_y1), (pit_x2, pit_y2), (0, 255, 0), 3)
                 st.image(vis_frame, caption=f"Frame at 60% ({frame_idx}) - Detection Region", use_container_width=True)
         
-        prev_gray = gray
         frame_idx += 1
         
         if frame_idx % 10 == 0:
@@ -163,14 +183,17 @@ def detect_motion_and_analyze(video_path):
     progress_bar.empty()
     status_text.empty()
     
-    # Estimate crew count from activity levels
+    # Calculate crew statistics
     if len(crew_activity) > 0:
         crew_activity_array = np.array(crew_activity)
-        # Normalize and estimate (rough heuristic)
         avg_activity = np.mean(crew_activity_array[crew_activity_array > np.percentile(crew_activity_array, 50)])
-        estimated_crew = min(int(avg_activity / 5000), 20)  # Cap at 20
+        estimated_crew = min(int(avg_activity / 5000), 20)
     else:
         estimated_crew = 0
+    
+    # Find peak activity
+    max_activity_idx = np.argmax(crew_activity) if len(crew_activity) > 0 else 0
+    max_activity_time = max_activity_idx / fps if fps > 0 else 0
     
     stats = {
         'total_frames': frame_count,
@@ -178,12 +201,11 @@ def detect_motion_and_analyze(video_path):
         'duration': duration,
         'stop_start_frame': stop_start_frame,
         'stop_end_frame': stop_end_frame,
-        'motion_timeline': motion_timeline,
-        'car_present': car_present,
+        'car_positions': car_positions,
+        'horizontal_velocities': horizontal_velocities,
         'crew_activity': crew_activity,
         'estimated_crew': estimated_crew,
-        'max_activity_frame': max_activity_frame,
-        'max_activity_time': max_activity_frame / fps if fps > 0 else 0
+        'max_activity_time': max_activity_time
     }
     
     return stats
@@ -205,7 +227,7 @@ def display_statistics(stats):
             pit_duration = (stats['stop_end_frame'] - stats['stop_start_frame']) / stats['fps']
             st.metric("Pit Stop Duration", f"{pit_duration:.2f}s")
         else:
-            st.metric("Pit Stop Duration", "Detecting...")
+            st.metric("Pit Stop Duration", "Not detected")
     
     with col3:
         st.metric("Estimated Crew", f"~{stats['estimated_crew']}")
@@ -234,25 +256,39 @@ def display_statistics(stats):
             work_time = (stats['stop_end_frame'] - stats['stop_start_frame']) / stats['fps']
             st.write(f"{work_time:.2f}s")
     
-    # Motion timeline chart
-    if len(stats['motion_timeline']) > 0:
-        st.subheader("Activity Timeline")
+    # Car tracking chart
+    if len(stats['car_positions']) > 0:
+        st.subheader("Car Position Tracking")
         
-        timeline_data = pd.DataFrame({
-            'Frame': range(len(stats['motion_timeline'])),
-            'Time (s)': [i / stats['fps'] for i in range(len(stats['motion_timeline']))],
-            'Motion Level': stats['motion_timeline'],
-            'Crew Activity': [a / 1000 for a in stats['crew_activity']],  # Scale for visibility
+        positions_df = pd.DataFrame(
+            stats['car_positions'], 
+            columns=['Frame', 'X Position', 'Y Position', 'Area']
+        )
+        positions_df['Time (s)'] = positions_df['Frame'] / stats['fps']
+        
+        # Create chart showing horizontal position and velocity
+        chart_data = pd.DataFrame({
+            'Time (s)': positions_df['Time (s)'],
+            'X Position': positions_df['X Position'],
         })
         
-        st.line_chart(timeline_data.set_index('Time (s)')[['Motion Level', 'Crew Activity']])
+        st.line_chart(chart_data.set_index('Time (s)'))
+        
+        # Velocity chart
+        if len(stats['horizontal_velocities']) > 0:
+            st.subheader("Horizontal Velocity")
+            velocity_df = pd.DataFrame({
+                'Time (s)': [i / stats['fps'] for i in range(len(stats['horizontal_velocities']))],
+                'Velocity (pixels/frame)': stats['horizontal_velocities']
+            })
+            st.line_chart(velocity_df.set_index('Time (s)'))
         
         # Download button
-        csv = timeline_data.to_csv(index=False)
+        csv = positions_df.to_csv(index=False)
         st.download_button(
-            label="Download Timeline Data",
+            label="Download Position Data",
             data=csv,
-            file_name="pit_stop_analysis.csv",
+            file_name="pit_stop_car_tracking.csv",
             mime="text/csv"
         )
     
@@ -272,30 +308,36 @@ def display_statistics(stats):
         if stats['estimated_crew'] >= 8:
             insights.append(f"👥 Full crew detected (~{stats['estimated_crew']} members)")
         
+        if len(stats['car_positions']) > 0:
+            insights.append(f"🎯 Car successfully tracked through {len(stats['car_positions'])} frames")
+        
         for insight in insights:
             st.info(insight)
+    else:
+        st.warning("⚠️ Could not detect car stop/start times. Try adjusting the video quality or camera angle.")
 
 def main():
     st.sidebar.header("About")
     st.sidebar.info(
-        "This application analyzes overhead pit stop videos using computer vision. "
-        "It detects motion patterns, tracks the car's stationary period, "
-        "and estimates crew activity levels."
+        "This application analyzes overhead pit stop videos by tracking the race car's position. "
+        "It detects when the car stops and departs based on horizontal movement."
     )
     
     st.sidebar.header("How It Works")
     st.sidebar.markdown("""
-    1. **Motion Detection**: Tracks frame-to-frame changes
-    2. **Car Detection**: Identifies when vehicle is stationary in center
-    3. **Crew Tracking**: Monitors activity around pit box edges
-    4. **Timing Analysis**: Measures pit stop duration
+    1. **Car Detection**: Uses HSV color detection to find the car
+    2. **Position Tracking**: Monitors horizontal movement
+    3. **Stop Detection**: Identifies when car becomes stationary (<2 pixels/frame)
+    4. **Departure Detection**: Detects when car starts moving again
+    5. **Crew Activity**: Monitors motion around pit box edges
     """)
     
     st.sidebar.header("Tips")
     st.sidebar.markdown("""
-    - Works best with stable overhead camera angles
-    - Fisheye lens distortion is handled automatically
-    - Algorithm adapts to different lighting conditions
+    - Works best with overhead camera angles
+    - Car should be distinctly colored (green works well)
+    - Good lighting improves detection accuracy
+    - May need to adjust color thresholds for different cars
     """)
     
     # File uploader
@@ -315,7 +357,7 @@ def main():
         
         if st.button("Analyze Pit Stop", type="primary"):
             with st.spinner("Analyzing video... This may take a few minutes."):
-                stats = detect_motion_and_analyze(tmp_path)
+                stats = analyze_pit_stop(tmp_path)
                 
                 if stats:
                     st.success("✅ Analysis complete!")
