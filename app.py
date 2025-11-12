@@ -98,28 +98,42 @@ def detect_motion_and_analyze(video_path):
         
         crew_activity.append(crew_motion)
         
-        # In a pit stop, HIGH motion indicates car is stopped with crew working
-        # LOW motion indicates car is moving (entering or exiting)
-        
-        # Car is stationary when there's HIGH activity (crew working)
-        is_stationary = motion_percentage > 8.0  # High motion = stopped with crew
-        has_car = frame_idx > fps * 2  # Skip first 2 seconds (car entering)
-        
         motion_timeline.append(motion_percentage)
-        car_present.append(is_stationary and has_car)
         
-        # Track pit stop timing
-        if is_stationary and has_car:
-            stationary_count += 1
-            moving_count = 0
+        # Pit stop detection strategy:
+        # 1. Look for motion crossing ABOVE 12% threshold (car stops, crew rushes)
+        # 2. Then wait for motion to drop BELOW 8% and stay there (car is stationary)
+        # 3. Exit when motion spikes ABOVE 8% again after being low (car departs)
+        
+        if not stop_detected:
+            # Looking for entry - need to see high motion spike first
+            if motion_percentage > 12.0 and frame_idx > fps * 2:
+                stationary_count += 1
+                if stationary_count > fps * 0.5:
+                    stop_start_frame = frame_idx - int(fps * 0.5) 
+                    stop_detected = True
+                    stationary_count = 0
+            else:
+                stationary_count = 0
+        
+        elif stop_detected and stop_end_frame is None:
+            # Car is stopped - wait for motion to spike again (departure)
+            # But ignore spikes in the first 20 seconds (initial crew activity)
+            time_since_stop = (frame_idx - stop_start_frame) / fps
             
-            if stationary_count > fps * 0.5 and not stop_detected:  # 0.5 second threshold
-                stop_start_frame = frame_idx - int(fps * 0.5)
-                stop_detected = True
+            if time_since_stop > 20 and motion_percentage > 10.0:
+                # Possible departure
+                moving_count += 1
+                if moving_count > fps * 1.0:
+                    stop_end_frame = frame_idx - int(fps * 1.0)
+            else:
+                moving_count = 0
+        
+        # Track car presence
+        if stop_detected and stop_end_frame is None:
+            car_present.append(True)
         else:
-            moving_count += 1
-            if moving_count > fps * 0.5 and stop_detected and stop_end_frame is None:
-                stop_end_frame = frame_idx - int(fps * 0.5)
+            car_present.append(False)
         
         # Track maximum activity
         if crew_motion > max_activity_value:
